@@ -39,18 +39,36 @@ def generate_roster(year, month, total_employees, time_off_requests=None, public
         for day in range(1, num_days - 1):
             model.Add(shifts[(emp, day)] + shifts[(emp, day+1)] + shifts[(emp, day+2)] <= 1)
             
-    # Objective: Balance Workloads for Fairness
-    total_shifts = {}
-    weekend_shifts = {}
-    
+    # --- PRE-CALCULATE DAY TYPES ---
+    # 1. Premium Days (Weekends & Holidays)
     premium_days = set([
         d for d in range(1, num_days + 1) 
         if calendar.weekday(year, month, d) >= 5 or d in public_holidays
     ])
     
+    # 2. Pre-Regular Days (Days where the *next* day is a standard workday)
+    pre_regular_days = set()
+    for d in range(1, num_days + 1):
+        if d < num_days:
+            # If tomorrow is not a premium day, today is a pre-regular day
+            if (d + 1) not in premium_days:
+                pre_regular_days.add(d)
+        else:
+            # For the last day of the month, check the 1st of the next month
+            next_month = month % 12 + 1
+            next_year = year + 1 if month == 12 else year
+            if calendar.weekday(next_year, next_month, 1) < 5:
+                pre_regular_days.add(d)
+                
+    # --- OBJECTIVE: BALANCE WORKLOADS ---
+    total_shifts = {}
+    weekend_shifts = {}
+    pre_regular_shifts = {} # New tracking dictionary
+    
     for emp in employees:
         total_shifts[emp] = sum(shifts[(emp, day)] for day in range(1, num_days + 1))
         weekend_shifts[emp] = sum(shifts[(emp, day)] for day in premium_days)
+        pre_regular_shifts[emp] = sum(shifts[(emp, day)] for day in pre_regular_days)
         
     min_shifts = model.NewIntVar(0, num_days, 'min_shifts')
     max_shifts = model.NewIntVar(0, num_days, 'max_shifts')
@@ -61,8 +79,20 @@ def generate_roster(year, month, total_employees, time_off_requests=None, public
     max_weekend = model.NewIntVar(0, num_days, 'max_weekend')
     model.AddMinEquality(min_weekend, [weekend_shifts[emp] for emp in employees])
     model.AddMaxEquality(max_weekend, [weekend_shifts[emp] for emp in employees])
+
+    # New Min/Max bounds for Pre-Regular shifts
+    min_pre_reg = model.NewIntVar(0, num_days, 'min_pre_reg')
+    max_pre_reg = model.NewIntVar(0, num_days, 'max_pre_reg')
+    model.AddMinEquality(min_pre_reg, [pre_regular_shifts[emp] for emp in employees])
+    model.AddMaxEquality(max_pre_reg, [pre_regular_shifts[emp] for emp in employees])
     
-    model.Minimize((max_shifts - min_shifts) * 10 + (max_weekend - min_weekend))
+    # Minimize the differences. Weights (20, 10, 5) tell the solver to prioritize 
+    # overall total shifts slightly higher than the specific sub-categories.
+    model.Minimize(
+        (max_shifts - min_shifts) * 20 + 
+        (max_weekend - min_weekend) * 10 +
+        (max_pre_reg - min_pre_reg) * 5
+    )
     
     # Solve the Model
     solver = cp_model.CpSolver()
@@ -74,10 +104,12 @@ def generate_roster(year, month, total_employees, time_off_requests=None, public
         roster = {}
         shift_counts = {emp: 0 for emp in employees}
         weekend_counts = {emp: 0 for emp in employees}
+        pre_regular_counts = {emp: 0 for emp in employees}
         
         for day in range(1, num_days + 1):
             assigned = []
             is_premium_day = day in premium_days 
+            is_pre_reg_day = day in pre_regular_days
             
             for emp in employees:
                 if solver.Value(shifts[(emp, day)]) == 1:
@@ -85,20 +117,22 @@ def generate_roster(year, month, total_employees, time_off_requests=None, public
                     shift_counts[emp] += 1
                     if is_premium_day:
                         weekend_counts[emp] += 1
+                    if is_pre_reg_day:
+                        pre_regular_counts[emp] += 1
                         
             roster[day] = assigned
             
-        return roster, shift_counts, weekend_counts
+        return roster, shift_counts, weekend_counts, pre_regular_counts
     else:
         raise ValueError("No feasible schedule exists with these constraints.")
 
 # --- 2. THE UI FRAMEWORK ---
-st.set_page_config(page_title="Shift Roster Generator", layout="wide")
-st.title("Shift Roster Calendar Generator")
+st.set_page_config(page_title="On-Call Schedule", layout="wide")
+st.title("On-Call Schedule")
 
 # Sidebar Configuration
 with st.sidebar:
-    st.header("Roster Settings")
+    st.header("Settings")
     current_year = datetime.now().year
     current_month = datetime.now().month
     year = st.number_input("Year", min_value=current_year, max_value=2099, value=current_year)
@@ -107,15 +141,15 @@ with st.sidebar:
     
     st.markdown("---")
     st.header("Global Rules")
-    holidays_str = st.text_input("Public Holidays (Dates)", placeholder="e.g. 4, 10, 25")
+    holidays_str = st.text_input("Public Holidays (Dates)", placeholder="e.g. 4, 10, 25", help="Weekends are automatically included. Enter public holidays only.")
     
     public_holidays = []
     if holidays_str:
         public_holidays = [int(d.strip()) for d in holidays_str.split(",") if d.strip().isdigit()]
 
 # Main Page: Blackout Dates
-st.subheader("Time-Off Requests (Blackout Dates)")
-st.caption("Enter the dates (1-31) an employee cannot work, separated by commas.")
+st.subheader("Excluded Dates")
+st.caption("Enter dates (1–31) to exclude, separated by commas. (e.g. 4, 10, 25)")
 
 time_off_requests = {}
 cols = st.columns(4) 
@@ -133,55 +167,50 @@ if st.button("Generate Roster", type="primary"):
     start_time = time.time()
     
     try:
-        schedule, total_shifts, weekend_shifts = generate_roster(
+        schedule, total_shifts, weekend_shifts, pre_regular_shifts = generate_roster(
             year, month, total_employees, time_off_requests, public_holidays
         )
         
         solve_time = time.time() - start_time
         st.success(f"Roster successfully generated in {solve_time:.4f} seconds!")
         
-        # Give the calendar slightly more room by adjusting the column ratio
-        col1, col2 = st.columns([2.5, 1])
+        # --- Row 1: Calendar 區塊 ---
+        st.subheader(f"Calendar: {calendar.month_name[month]} {year}")
         
-        with col1:
-            st.subheader(f"Calendar: {calendar.month_name[month]} {year}")
+        cal_matrix = calendar.monthcalendar(year, month)
+        weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        
+        calendar_data = []
+        for week in cal_matrix:
+            week_dict = {}
+            for i, day in enumerate(week):
+                if day == 0:
+                    week_dict[weekdays[i]] = ""
+                else:
+                    workers = schedule.get(day, [])
+                    staff_str = ", ".join(workers)
+                    marker = " 🌟" if day in public_holidays else ""
+                    week_dict[weekdays[i]] = f"{day}{marker}\n{staff_str}"
             
-            # 1. Fetch the 2D array of weeks/days for the given month
-            cal_matrix = calendar.monthcalendar(year, month)
-            weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+            calendar_data.append(week_dict)
             
-            # 2. Build the grid row by row
-            calendar_data = []
-            for week in cal_matrix:
-                week_dict = {}
-                for i, day in enumerate(week):
-                    if day == 0:
-                        # Day belongs to previous/next month
-                        week_dict[weekdays[i]] = ""
-                    else:
-                        workers = schedule.get(day, [])
-                        staff_str = ", ".join(workers)
-                        marker = " 🌟" if day in public_holidays else ""
-                        
-                        # Use line breaks (\n) to stack the date above the staff name
-                        week_dict[weekdays[i]] = f"{day}{marker}\n{staff_str}"
-                
-                calendar_data.append(week_dict)
-                
-            # 3. Render the 7-day grid using Streamlit's dataframe
-            df_cal = pd.DataFrame(calendar_data)
-            st.dataframe(df_cal, use_container_width=True, hide_index=True)
-            
-        with col2:
-            st.subheader("Workload Distribution")
-            stats_data = []
-            for emp in total_shifts.keys():
-                stats_data.append({
-                    "Employee": emp,
-                    "Total Shifts": total_shifts[emp],
-                    "Premium Shifts (Wknd/Hol)": weekend_shifts[emp]
-                })
-            st.dataframe(pd.DataFrame(stats_data), use_container_width=True, hide_index=True)
+        df_cal = pd.DataFrame(calendar_data)
+        st.dataframe(df_cal, use_container_width=True, hide_index=True)
+
+        # 視覺分隔線（可選，讓兩個 Row 區塊分界更清晰）
+        st.divider()
+        
+        # --- Row 2: Workload Distribution 區塊 ---
+        st.subheader("Workload Distribution")
+        stats_data = []
+        for emp in total_shifts.keys():
+            stats_data.append({
+                "Employee": emp,
+                "Total": total_shifts[emp],
+                "Weekends & Holidays": weekend_shifts[emp],
+                "Offs": pre_regular_shifts[emp] # Added column
+            })
+        st.dataframe(pd.DataFrame(stats_data), use_container_width=True, hide_index=True)
 
     except ValueError as e:
         solve_time = time.time() - start_time
