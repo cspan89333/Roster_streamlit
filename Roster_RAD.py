@@ -201,7 +201,7 @@ if st.button("Generate Roster", type="primary"):
         st.divider()
         
         # --- Row 2: Workload Distribution 區塊 ---
-        st.subheader("Workload Distribution")
+        st.subheader("Workload Distribution",help="If the first day of the following month falls on a weekday, it counts as a scheduled day off. However, if it happens to be a public holiday, please manually deduct that off day yourself.")
         stats_data = []
         for emp in total_shifts.keys():
             stats_data.append({
